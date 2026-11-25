@@ -8,8 +8,18 @@ Deploy on Render
                       asyncpg
   Build command    :  pip install -r requirements.txt
   Start command    :  uvicorn main:app --host 0.0.0.0 --port $PORT
-  Environment      :  DATABASE_URL      (Neon connection string - required for persistence)
-                      ALLOWED_ORIGINS   (optional, comma separated, default "*")
+  Environment      :  DATABASE_URL      Neon connection string (needed for persistence)
+                      ALLOWED_ORIGINS   optional, comma separated, default "*"
+                      TURN_URLS         optional, comma separated  e.g. turn:global.relay.metered.ca:80,turns:global.relay.metered.ca:443?transport=tcp
+                      TURN_USERNAME     optional  } static TURN credentials (Metered, Twilio, ...)
+                      TURN_CREDENTIAL   optional  }
+                      TURN_SECRET       optional  shared secret of your own coturn ("use-auth-secret"); makes short-lived credentials
+
+Health check (for your cron job)
+--------------------------------
+  GET/HEAD /health              -> instant {"ok": true, ...}               (keeps Render awake)
+  GET/HEAD /health?deep=1       -> also runs SELECT 1 on Neon, and retries the DB connection if it was down
+  /healthz and /api/health are aliases.  Ping every 5-10 minutes (Render free instances sleep after 15 idle minutes).
 
 How it works
 ------------
@@ -21,14 +31,23 @@ It is the *referee of order and luck*:
   * it relays each accepted move to both players, who apply it with the same engine,
   * a player who reconnects (or a server that restarts) gets the full move log and replays it.
 
+Player communication (same WebSocket):
+  * text chat + emoji reactions: validated, rate limited, kept (last 100) in memory and in Neon,
+  * voice call: WebRTC peer-to-peer audio. The server only relays the signalling (offer / answer / ICE)
+    and hands out the ICE (STUN/TURN) servers. Audio never passes through this server.
+
 If DATABASE_URL is missing or Neon is unreachable the server keeps working in memory only.
 """
 import asyncio
+import base64
+import hashlib
+import hmac
 import json
 import logging
 import os
 import secrets
 import time
+import unicodedata
 from contextlib import asynccontextmanager
 from typing import Optional
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -49,13 +68,19 @@ ALLOWED_ACTIONS = {
     "roll", "enter", "enter_pay", "move", "unfreeze", "unfreeze_pay",
     "freeze", "recover", "pass", "setback_pay", "setback_accept",
 }
+RTC_KINDS = {"offer", "answer", "ice", "hangup", "decline", "busy"}
 MAX_ROOMS = 5000
+MAX_MSG = 24000                 # biggest accepted WebSocket frame (SDP offers are a few KB)
+CHAT_MAX = 300                  # characters per chat message
+CHAT_KEEP = 100                 # messages kept per room
 MEMORY_TTL = 6 * 3600           # drop idle rooms from memory after 6 h (they stay in Neon)
 DB_TTL_DAYS = 3                 # delete rooms from Neon after 3 days without activity
+STARTED = time.time()
 
 POOL: Optional[asyncpg.Pool] = None
 ROOMS: "dict[str, Room]" = {}
 LOAD_LOCK = asyncio.Lock()
+DB_LOCK = asyncio.Lock()
 
 
 # ----------------------------------------------------------------------------- database
@@ -83,6 +108,15 @@ CREATE TABLE IF NOT EXISTS rankco_moves (
     dice    INT,
     PRIMARY KEY (code, seq)
 );
+CREATE TABLE IF NOT EXISTS rankco_chat (
+    code    TEXT NOT NULL REFERENCES rankco_rooms(code) ON DELETE CASCADE,
+    mid     INT  NOT NULL,
+    seat    INT  NOT NULL,
+    kind    TEXT NOT NULL,
+    body    TEXT NOT NULL,
+    ts      BIGINT NOT NULL,
+    PRIMARY KEY (code, mid)
+);
 """
 
 
@@ -94,7 +128,7 @@ async def init_db():
         return
     dsn, host = make_dsn(url)
     try:
-        POOL = await asyncpg.create_pool(
+        pool = await asyncpg.create_pool(
             dsn,
             min_size=1,
             max_size=5,
@@ -104,8 +138,9 @@ async def init_db():
             command_timeout=30,
             timeout=40,                             # first connect can wake a suspended Neon compute
         )
-        async with POOL.acquire() as con:
+        async with pool.acquire() as con:
             await con.execute(SCHEMA)
+        POOL = pool
         log.info("Neon connected")
     except Exception:
         log.exception("Could not connect to the database - running in memory-only mode")
@@ -123,12 +158,15 @@ async def db_exec(sql: str, *args):
 
 # ----------------------------------------------------------------------------- rooms
 class Room:
-    def __init__(self, code, status, seats, cfg=None, moves=None):
+    def __init__(self, code, status, seats, cfg=None, moves=None, chat=None):
         self.code = code
         self.status = status            # waiting | playing | closed
         self.seats = seats              # [{name, color, token}]
         self.cfg = cfg                  # engine config once two players are seated
         self.log = moves or []          # [{seq, pid, action, dice}]
+        self.chat = chat or []          # [{id, seat, kind('m'|'e'), text, ts}]
+        self.chat_next = (self.chat[-1]["id"] + 1) if self.chat else 0
+        self.rate: dict = {}            # (seat, bucket) -> [timestamps]
         self.sockets: "dict[int, WebSocket]" = {}
         self.lock = asyncio.Lock()
         self.touched = time.time()
@@ -149,11 +187,26 @@ def seats_public(room: Room):
     ]
 
 
+def ice_servers():
+    """STUN is free; TURN (relay) is needed when both players are behind strict / mobile NATs."""
+    servers = [{"urls": ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"]}]
+    urls = [u.strip() for u in os.getenv("TURN_URLS", "").split(",") if u.strip()]
+    if urls:
+        secret = os.getenv("TURN_SECRET", "")
+        if secret:                                   # coturn "use-auth-secret": short-lived credentials
+            user = f"{int(time.time()) + 6 * 3600}:rankco"
+            cred = base64.b64encode(hmac.new(secret.encode(), user.encode(), hashlib.sha1).digest()).decode()
+            servers.append({"urls": urls, "username": user, "credential": cred})
+        elif os.getenv("TURN_USERNAME"):
+            servers.append({"urls": urls, "username": os.getenv("TURN_USERNAME"), "credential": os.getenv("TURN_CREDENTIAL", "")})
+    return servers
+
+
 def state_for(room: Room, seat: int, force: bool = False):
     return {
         "type": "state", "code": room.code, "status": room.status, "seat": seat,
         "pid": pid_of(room, seat), "seats": seats_public(room), "cfg": room.cfg,
-        "log": room.log, "force": force,
+        "log": room.log, "chat": room.chat, "ice": ice_servers(), "force": force,
     }
 
 
@@ -180,13 +233,16 @@ async def load_room(code: str) -> Optional[Room]:
         if not row:
             return None
         rows = await POOL.fetch("SELECT seq, pid, action, dice FROM rankco_moves WHERE code=$1 ORDER BY seq", code)
+        crow = await POOL.fetch(
+            "SELECT mid, seat, kind, body, ts FROM rankco_chat WHERE code=$1 ORDER BY mid DESC LIMIT $2", code, CHAT_KEEP)
     except Exception:
         log.exception("db read failed")
         return None
     moves = [{"seq": r["seq"], "pid": r["pid"], "action": json.loads(r["action"]), "dice": r["dice"]} for r in rows]
     if any(m["seq"] != i for i, m in enumerate(moves)):
         moves = moves[: next(i for i, m in enumerate(moves) if m["seq"] != i)]
-    return Room(code, row["status"], json.loads(row["seats"]), json.loads(row["cfg"]) if row["cfg"] else None, moves)
+    chat = [{"id": c["mid"], "seat": c["seat"], "kind": c["kind"], "text": c["body"], "ts": c["ts"]} for c in reversed(crow)]
+    return Room(code, row["status"], json.loads(row["seats"]), json.loads(row["cfg"]) if row["cfg"] else None, moves, chat)
 
 
 async def get_room(code: str) -> Optional[Room]:
@@ -229,6 +285,30 @@ def clean_action(a) -> Optional[dict]:
     return out
 
 
+def clean_text(value, limit: int = CHAT_MAX) -> str:
+    """Collapse whitespace, drop control characters (zero-width joiners used by emoji are kept)."""
+    if not isinstance(value, str):
+        return ""
+    t = " ".join(value.split())
+    t = "".join(ch for ch in t if unicodedata.category(ch) not in ("Cc", "Cs"))
+    return t[:limit].strip()
+
+
+def clean_emoji(value) -> str:
+    e = clean_text(value, 12)
+    return "" if (not e or any(ch.isalnum() for ch in e)) else e
+
+
+def rate_ok(room: Room, seat: int, bucket: str, limit: int, per: float) -> bool:
+    now = time.time()
+    lst = [t for t in room.rate.get((seat, bucket), []) if now - t < per]
+    ok = len(lst) < limit
+    if ok:
+        lst.append(now)
+    room.rate[(seat, bucket)] = lst
+    return ok
+
+
 # ----------------------------------------------------------------------------- app
 async def janitor():
     while True:
@@ -266,8 +346,31 @@ async def root():
 
 
 @app.api_route("/health", methods=["GET", "HEAD"])
-async def health():
-    return {"ok": True, "db": POOL is not None, "rooms": len(ROOMS)}
+@app.api_route("/healthz", methods=["GET", "HEAD"])
+@app.api_route("/api/health", methods=["GET", "HEAD"])
+async def health(deep: int = 0):
+    """Cron-job target.  Plain call = instant.  ?deep=1 also touches Neon (and reconnects to it if it was down)."""
+    db_ok = None
+    if deep:
+        if POOL is None and os.getenv("DATABASE_URL"):
+            async with DB_LOCK:
+                if POOL is None:
+                    await init_db()
+        if POOL is not None:
+            try:
+                await POOL.fetchval("SELECT 1")
+                db_ok = True
+            except Exception:
+                log.exception("health: db check failed")
+                db_ok = False
+    return {
+        "ok": True,
+        "db": POOL is not None,
+        "db_ok": db_ok,
+        "rooms": len(ROOMS),
+        "uptime_s": int(time.time() - STARTED),
+        "time": int(time.time()),
+    }
 
 
 @app.post("/api/rooms")
@@ -349,7 +452,7 @@ async def ws_endpoint(ws: WebSocket, code: str, token: str = ""):
     try:
         while True:
             raw = await ws.receive_text()
-            if len(raw) > 2000:
+            if len(raw) > MAX_MSG:
                 continue
             try:
                 msg = json.loads(raw)
@@ -372,6 +475,10 @@ async def ws_endpoint(ws: WebSocket, code: str, token: str = ""):
                 break
             elif kind == "action":
                 await handle_action(room, seat, ws, msg)
+            elif kind in ("chat", "emoji"):
+                await handle_chat(room, seat, ws, msg, kind)
+            elif kind == "rtc":
+                await handle_rtc(room, seat, ws, msg)
     except WebSocketDisconnect:
         pass
     except Exception:
@@ -409,3 +516,56 @@ async def handle_action(room: Room, seat: int, ws: WebSocket, msg: dict):
                 "WITH ins AS (INSERT INTO rankco_moves(code,seq,pid,action,dice) VALUES($1,$2,$3,$4::jsonb,$5) "
                 "ON CONFLICT DO NOTHING RETURNING 1) UPDATE rankco_rooms SET updated_at=now() WHERE code=$1",
                 room.code, seq, pid, json.dumps(action), dice)
+
+
+async def handle_chat(room: Room, seat: int, ws: WebSocket, msg: dict, kind: str):
+    """Text message ('chat') or floating emoji reaction ('emoji'); both are stored and sent to both players."""
+    if room.status != "playing":
+        return
+    if not rate_ok(room, seat, "chat", 10, 10.0):
+        await send_safe(ws, {"type": "chat_err", "error": "You are sending too fast - wait a moment"})
+        return
+    if kind == "chat":
+        text, k = clean_text(msg.get("text")), "m"
+    else:
+        text, k = clean_emoji(msg.get("emoji")), "e"
+    if not text:
+        return
+    async with room.lock:
+        entry = {"id": room.chat_next, "seat": seat, "kind": k, "text": text, "ts": int(time.time())}
+        room.chat_next += 1
+        room.chat.append(entry)
+        del room.chat[:-CHAT_KEEP]
+    await broadcast(room, {"type": "chat", "msg": entry})
+    await db_exec(
+        "INSERT INTO rankco_chat(code,mid,seat,kind,body,ts) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING",
+        room.code, entry["id"], seat, k, text, entry["ts"])
+
+
+async def handle_rtc(room: Room, seat: int, ws: WebSocket, msg: dict):
+    """Voice-call signalling: validated and forwarded to the other player only."""
+    k = msg.get("kind")
+    if k not in RTC_KINDS or not rate_ok(room, seat, "rtc", 150, 10.0):
+        return
+    out = {"type": "rtc", "kind": k}
+    if k in ("offer", "answer"):
+        sdp = msg.get("sdp")
+        if not isinstance(sdp, str) or not (10 < len(sdp) <= 16000):
+            return
+        out["sdp"] = sdp
+    elif k == "ice":
+        c = msg.get("candidate")
+        if not isinstance(c, dict) or not isinstance(c.get("candidate"), str) or len(c["candidate"]) > 1000:
+            return
+        mid, idx = c.get("sdpMid"), c.get("sdpMLineIndex")
+        out["candidate"] = {
+            "candidate": c["candidate"],
+            "sdpMid": mid if isinstance(mid, str) and len(mid) < 64 else None,
+            "sdpMLineIndex": idx if isinstance(idx, int) and not isinstance(idx, bool) else None,
+        }
+    other = room.sockets.get(1 - seat)
+    if other is None:
+        if k == "offer":
+            await send_safe(ws, {"type": "rtc", "kind": "unavailable"})
+        return
+    await send_safe(other, out)
